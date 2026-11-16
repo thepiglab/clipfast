@@ -77,7 +77,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), torch=torch.__version__,
-                job=os.environ.get("SLURM_JOB_ID"))
+                job=os.environ.get("CLIPFAST_RUN_ID"))
     out = open(a.out, "a")
 
     def rec(**kw):

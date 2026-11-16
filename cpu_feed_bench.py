@@ -85,7 +85,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    meta = dict(host=socket.gethostname(), cpus=len(os.sched_getaffinity(0)), job=os.environ.get("SLURM_JOB_ID"))
+    meta = dict(host=socket.gethostname(), cpus=len(os.sched_getaffinity(0)), job=os.environ.get("CLIPFAST_RUN_ID"))
     try:
         meta["cpu_model"] = [l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")][0]
     except Exception:  # noqa: BLE001

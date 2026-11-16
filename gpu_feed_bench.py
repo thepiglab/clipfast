@@ -41,7 +41,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     import torchvision.io as tio
-    meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), job=os.environ.get("SLURM_JOB_ID"))
+    meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), job=os.environ.get("CLIPFAST_RUN_ID"))
     out = open(a.out, "a")
 
     def rec(**kw):

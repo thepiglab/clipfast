@@ -78,7 +78,7 @@ def main():
     torch._dynamo.config.cache_size_limit = 64
     dev = torch.device("cuda")
     meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), torch=torch.__version__,
-                cuda=torch.version.cuda, job=os.environ.get("SLURM_JOB_ID"))
+                cuda=torch.version.cuda, job=os.environ.get("CLIPFAST_RUN_ID"))
     print(json.dumps(meta), flush=True)
     out = open(a.out, "a")
 

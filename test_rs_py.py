@@ -18,7 +18,7 @@ from bench import pmc_lengths  # noqa: E402
 
 def main(assets, out_path):
     out = open(out_path, "a")
-    meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), job=os.environ.get("SLURM_JOB_ID"))
+    meta = dict(host=socket.gethostname(), gpu=torch.cuda.get_device_name(), job=os.environ.get("CLIPFAST_RUN_ID"))
 
     def rec(**kw):
         kw.update(meta)
