@@ -102,8 +102,45 @@ What the front end does, all in Rust:
 Other commands: `parity` (against golden embeddings from `research/golden.py`), `bench`, `prep` (dump
 preprocessed pixels) and `tokenize`.
 
-**Next:** an int8 corpus index with exact re-ranking for retrieval, an opt-in MXFP8 encoder mode, and faster fp32
-parity mode (3xTF32).
+## Retrieval: int8 index with exact re-rank
+
+`clipfast-rs search` scores the whole corpus in int8 and then re-ranks the top 200 per query in exact fp32:
+- **Corpus:** int8 with one global scale, taken from the 99.9th percentile of per-vector max |x|.
+- **Queries:** int8 with a per-query scale.
+- **Scoring:** a `dp4a` kernel for 8 or fewer queries, and a CUTLASS int8 tensor-core GEMM above that.
+- **Re-rank copy:** the fp32 copy lives on the GPU ("device"), or in pinned host memory ("host": only about 200
+  rows per query cross PCIe).
+
+Measured on 2M x 512 vectors (200k real BiomedCLIP text embeddings plus 1.8M clustered synthetic vectors), top-10:
+
+| queries | exact fp32 | int8 + exact re-rank | top-10 identical to exact |
+|---|---|---|---|
+| 1 | 3.58 ms | **1.69 ms** | 1/1 |
+| 8 | 3.99 ms | **2.22 ms** | 8/8 |
+| 256 | 19.5 ms | **11.7 ms** | 256/256 |
+| 2048 | 130 ms | **92.4 ms** | 2045/2048 (the 3 rows differ only by ties within 1.1e-6) |
+
+GPU exact search and int8 + re-rank both match a CPU brute-force reference.
+
+Memory per million 512-d vectors:
+
+| re-rank copy | GPU memory | pinned host memory | speed (1 / 256 / 2048 queries) |
+|---|---|---|---|
+| device | 2.44 GB | none | as in the table above |
+| host | 0.49 GB | 1.95 GB | 1.73 ms / 15.0 ms / 109 ms |
+
+```bash
+clipfast-rs search --corpus run1.images.npy --names run1.images.txt --assets assets --texts queries.txt --k 10 [--rerank host]
+clipfast-rs search-bench --assets assets --real 200000 --synth 1800000 --nq 1,8,256,2048
+```
+
+## Lower-precision modes we measured (and do not recommend on RTX PRO 6000)
+
+| mode | parity vs open_clip fp32 | speed vs bf16 | verdict |
+|---|---|---|---|
+| `--quant mxfp8` (cuBLASLt block-scaled E4M3, scale per 32 values) | cos 0.9973 (image) / 0.9982 (text) | 0.76x (6.3k vs 8.3k img/s) | slower and less exact: the activation-quantize pass and the unfused epilogue cost more than the FP8 GEMM saves at ViT-B/BERT-base sizes |
+| `CLIPFAST_FP32_EMU=1` (BF16x9-emulated fp32) | identical to fp32 | 1.00x | no gain: native fp32 (82 TFLOPS here) beats bf16x9 (437/9) and 3xTF32 (217/3); worthwhile on datacenter GPUs only |
+
 
 ## Build
 
@@ -147,7 +184,9 @@ lists to Rust vectors). Parity is identical (cos 0.99990 / 0.99992 bf16, 0.99999
 | `rs/src/frontend.rs`, `rs/src/prep.rs` | tokenizer, image decode + open_clip-identical preprocessing, `.npy` output |
 | `rs/src/export.rs` | PyTorch checkpoint reader + runtime safetensors writer |
 | `rs/src/server.rs` | HTTP server |
-| `rs/src/main.rs` | CLI (`export`, `embed`, `serve`, `parity`, `bench`, `prep`, `tokenize`) |
+| `rs/src/search.rs`, `rs/cuda/search.cu`, `rs/cuda/cutlass_int8.cu` | int8 index + exact re-rank |
+| `rs/cuda/mxfp8.cu` | opt-in MXFP8 linears |
+| `rs/src/main.rs` | CLI (`export`, `embed`, `serve`, `search`, `search-bench`, `parity`, `bench`, `prep`, `tokenize`) |
 | `rs/src/py.rs`, `python/` | optional native Python extension + torch wrapper |
 | `research/` | PyTorch reference runtime and benchmarks against open_clip, parity goldens and tests, data-feeding benchmarks, kernel-autoresearch tasks |
 
@@ -160,5 +199,6 @@ decode on a side stream and synchronize it before use; we saw a race that produc
 
 ## Credits
 
-BiomedCLIP (Microsoft, MIT), open_clip, NVIDIA CUTLASS (BSD-3, fetched at build time, not vendored), and the
-kernel-autoresearch method (https://github.com/gauravjain14/kernel-autoresearch-plugin, Apache-2.0).
+BiomedCLIP (Microsoft, MIT), open_clip, NVIDIA CUTLASS (BSD-3, fetched at build time, not vendored). The int8
+search kernels and the MXFP8 quantizer are adapted from [flashcluster](https://github.com/thepiglab/flashcluster)
+and [flashembed](https://github.com/thepiglab/flashembed) (MIT). The kernel-autoresearch method (https://github.com/gauravjain14/kernel-autoresearch-plugin, Apache-2.0).

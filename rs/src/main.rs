@@ -11,6 +11,8 @@
 //!   clipfast-rs serve  --assets DIR [--port 8080] [--threads N]  (HTTP: POST /v1/embed/text, /v1/embed/image)
 //!   clipfast-rs search --corpus EMB.npy [--names NAMES.txt] (--queries Q.npy | --assets DIR --texts FILE)
 //!                      [--k 10] [--kc 200] [--rerank device|host] [--exact]   (int8 search + exact fp32 re-rank)
+//!   clipfast-rs cpu-parity --assets DIR [--format f32|bf16|q8] [--threads N] [--pin]      (CPU engine, AVX-512)
+//!   clipfast-rs cpu-bench  --assets DIR [--format ...] [--threads N] [--pin] [--img-b 1,16,64] [--txt-b 1,64,256]
 //!   clipfast-rs search-bench --assets DIR [--real 200000] [--synth 1800000] [--nq 1,8,256,2048] [--k 10]
 use anyhow::{anyhow, Result};
 use clipfast_rs::engine::*;
@@ -483,6 +485,92 @@ fn cmd_search_bench(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ---------------- CPU engine ----------------
+#[cfg(target_arch = "x86_64")]
+fn cpu_engine(args: &[String]) -> Result<(clipfast_rs::cpu::CpuEngine, String)> {
+    use clipfast_rs::cpu::{CpuEngine, Format};
+    let fs = arg(args, "--format").unwrap_or("f32".into());
+    let fmt = match fs.as_str() { "bf16" => Format::Bf16, "q8" | "q8blk" => Format::Q8Blk, _ => Format::F32 };
+    let threads = arg(args, "--threads").map(|s| s.parse()).transpose()?;
+    let e = CpuEngine::new(&arg(args, "--assets").ok_or(anyhow!("--assets"))?, fmt, threads, args.iter().any(|a| a == "--pin"))?;
+    let name = format!("cpu_{fs}_t{}", e.threads());
+    Ok((e, name))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cmd_cpu_parity(args: &[String]) -> Result<()> {
+    let assets = arg(args, "--assets").ok_or(anyhow!("--assets"))?;
+    let t0 = Instant::now();
+    let (e, name) = cpu_engine(args)?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let g = std::fs::read(format!("{assets}/golden.safetensors"))?;
+    let st = SafeTensors::deserialize(&g)?;
+    let (px, _) = tensor_f32(&st, "pixels")?;
+    let (ids, is) = tensor_i32(&st, "ids")?;
+    let (ri, _) = tensor_f32(&st, "img_emb")?;
+    let (rt, _) = tensor_f32(&st, "txt_emb")?;
+    let (nt, l) = (is[0], is[1]);
+    let rows: Vec<Vec<i32>> = (0..nt).map(|i| ids[i * l..(i + 1) * l].iter().cloned().take_while(|&t| t != PAD).collect()).collect();
+    let ei = e.encode_images(&px);
+    let et = e.encode_texts(&rows);
+    let cos = |a: &[f32], b: &[f32]| -> (f64, f64) {
+        let v: Vec<f64> = a.chunks(E).zip(b.chunks(E)).map(|(x, y)| dot(x, y)).collect();
+        (v.iter().cloned().fold(f64::MAX, f64::min), v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let (ic, icm) = cos(&ei, &ri);
+    let (tc, tcm) = cos(&et, &rt);
+    let ni = ri.len() / E;
+    let i2t = (0..ni).filter(|&i| {
+        let s = |emb: &[f32], txt: &[f32]| -> usize {
+            argmax(&(0..nt).map(|j| dot(&emb[i * E..(i + 1) * E], &txt[j * E..(j + 1) * E])).collect::<Vec<_>>())
+        };
+        s(&ei, &et) == s(&ri, &rt)
+    }).count();
+    println!("{}", serde_json::json!({"kind": "acc", "impl": name, "img_cos_min": ic, "img_cos_mean": icm,
+        "txt_cos_min": tc, "txt_cos_mean": tcm, "i2t_top1_agree": format!("{i2t}/{ni}"), "weights_mb": e.weight_bytes as f64 / 1048576.0,
+        "load_s": load_s}));
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cmd_cpu_bench(args: &[String]) -> Result<()> {
+    let (e, name) = cpu_engine(args)?;
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    for bs in list(args, "--img-b", "1,16,64") {
+        let b: usize = bs.parse()?;
+        let px: Vec<f32> = (0..b * IMG).map(|_| rng.normal() as f32).collect();
+        e.encode_images(&px);
+        let reps = (32 / b).max(2);
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            e.encode_images(&px);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        println!("{}", serde_json::json!({"kind": "image", "impl": name, "B": b, "ms": ms, "img_per_s": b as f64 / ms * 1e3}));
+    }
+    for bs in list(args, "--txt-b", "1,64,256") {
+        let b: usize = bs.parse()?;
+        for ls in list(args, "--txt-l", "32,pmc") {
+            let rows: Vec<Vec<i32>> = (0..b).map(|_| {
+                let n = if ls == "pmc" { (40.0 * (0.8 * rng.normal()).exp()).round().clamp(5.0, 256.0) as usize } else { ls.parse().unwrap() };
+                let mut r = vec![2i32];
+                r.extend((0..n.saturating_sub(2)).map(|_| 1000 + (rng.next() % 29000) as i32));
+                r.push(3);
+                r
+            }).collect();
+            e.encode_texts(&rows);
+            let reps = (256 / b).clamp(2, 32);
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                e.encode_texts(&rows);
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            println!("{}", serde_json::json!({"kind": "text", "impl": name, "B": b, "L": ls, "ms": ms, "txt_per_s": b as f64 / ms * 1e3}));
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -492,6 +580,10 @@ fn main() -> Result<()> {
         Some("prep") => cmd_prep(&args),
         Some("tokenize") => cmd_tokenize(&args),
         Some("search") => cmd_search(&args),
+        #[cfg(target_arch = "x86_64")]
+        Some("cpu-parity") => cmd_cpu_parity(&args),
+        #[cfg(target_arch = "x86_64")]
+        Some("cpu-bench") => cmd_cpu_bench(&args),
         Some("search-bench") => cmd_search_bench(&args),
         Some("export") => {
             let md = arg(&args, "--model-dir").ok_or(anyhow!("--model-dir"))?;
