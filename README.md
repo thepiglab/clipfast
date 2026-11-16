@@ -134,6 +134,35 @@ clipfast-rs search --corpus run1.images.npy --names run1.images.txt --assets ass
 clipfast-rs search-bench --assets assets --real 200000 --synth 1800000 --nq 1,8,256,2048
 ```
 
+## CPU-only inference (x86-64 with AVX-512)
+
+`clipfast-rs cpu-parity` and `cpu-bench` run the same model on CPU threads, using the same folding, packed text and
+CLS-only last layer as the GPU engine. It needs AVX-512, plus AVX-512 BF16 for `--format bf16` and AVX-512 VNNI for
+`--format q8`. Three linear-layer formats:
+- **`f32`:** exact parity mode, AVX-512 FMA over packed weight panels.
+- **`bf16`:** bf16 weights and activations with f32 accumulate (`vdpbf16ps`).
+- **`q8`:** block-scaled W8A8 with an int8 scale per 32 K-values, for weights per output row and activations per
+  input row (`vpdpbusd` int32 accumulate).
+
+Attention, LayerNorm, GELU (erf, max error 3e-7) and the residual stream stay f32. Threads can be pinned (`--pin`).
+
+Measured on AMD EPYC 9655P (Zen 5), 16 threads:
+
+| | **q8** | bf16 | f32 | PyTorch bf16 autocast | PyTorch fp32 |
+|---|---|---|---|---|---|
+| parity: cos min (image / text) vs open_clip fp32 | 0.99980 / 0.99988 | 0.99997 / 0.99999 | 0.999999 / 1.000000 | | |
+| image, 1 image | **19.2 ms** | 22.4 ms | 33.2 ms | 30.5 ms | 45.9 ms |
+| images, batch 16 | **80.6 img/s** | 72.2 | 47.2 | 77.8 | 27.9 |
+| text, 64 captions x 32 tokens | **726 /s** | 605 | 349 | 46 (padded to 256) | 18 |
+| text, 256 PubMed-like captions | **406 /s** | 373 | 227 | | |
+
+All three formats agree with open_clip on image-to-text top-1 (32/32). Weights take 297 MB (q8), 420 MB (bf16) and
+747 MB (f32).
+
+```bash
+clipfast-rs cpu-bench --assets assets --format q8 --threads 16 --pin
+```
+
 ## Lower-precision modes we measured (and do not recommend on RTX PRO 6000)
 
 | mode | parity vs open_clip fp32 | speed vs bf16 | verdict |
@@ -186,7 +215,8 @@ lists to Rust vectors). Parity is identical (cos 0.99990 / 0.99992 bf16, 0.99999
 | `rs/src/server.rs` | HTTP server |
 | `rs/src/search.rs`, `rs/cuda/search.cu`, `rs/cuda/cutlass_int8.cu` | int8 index + exact re-rank |
 | `rs/cuda/mxfp8.cu` | opt-in MXFP8 linears |
-| `rs/src/main.rs` | CLI (`export`, `embed`, `serve`, `search`, `search-bench`, `parity`, `bench`, `prep`, `tokenize`) |
+| `rs/src/cpu.rs` | CPU engine (AVX-512 f32 / bf16 / block-scaled int8) |
+| `rs/src/main.rs` | CLI (`export`, `embed`, `serve`, `search`, `search-bench`, `cpu-parity`, `cpu-bench`, `parity`, `bench`, `prep`, `tokenize`) |
 | `rs/src/py.rs`, `python/` | optional native Python extension + torch wrapper |
 | `research/` | PyTorch reference runtime and benchmarks against open_clip, parity goldens and tests, data-feeding benchmarks, kernel-autoresearch tasks |
 

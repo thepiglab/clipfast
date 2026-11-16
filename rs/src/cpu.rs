@@ -186,6 +186,40 @@ mod k {
         *out = acc;
     }
 
+    /// 32 floats at a time -> bf16 pairs (round to nearest even), as bf16_bits
+    #[target_feature(enable = "avx512f,avx512bf16")]
+    pub unsafe fn to_bf16_pairs(x: &[f32], out: &mut [u32]) {
+        for c in 0..x.len() / 32 {
+            let lo = _mm512_loadu_ps(x.as_ptr().add(c * 32));
+            let hi = _mm512_loadu_ps(x.as_ptr().add(c * 32 + 16));
+            let v: __m512i = std::mem::transmute(_mm512_cvtne2ps_pbh(hi, lo));
+            _mm512_storeu_si512(out.as_mut_ptr().add(c * 16) as *mut _, v);
+        }
+    }
+
+    /// per 32-value block: scale = max|x| / 127, q = round(x / scale) + 128 as u8
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub unsafe fn quant_row_u8(x: &[f32], out: &mut [u8], scales: &mut [f32]) {
+        let sign = _mm512_set1_ps(-0.0);
+        for b in 0..x.len() / 32 {
+            let v0 = _mm512_loadu_ps(x.as_ptr().add(b * 32));
+            let v1 = _mm512_loadu_ps(x.as_ptr().add(b * 32 + 16));
+            let m = _mm512_max_ps(_mm512_andnot_ps(sign, v0), _mm512_andnot_ps(sign, v1));
+            let amax = _mm512_reduce_max_ps(m);
+            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            scales[b] = s;
+            let inv = _mm512_set1_ps(1.0 / s);
+            let lim = _mm512_set1_ps(127.0);
+            let q0 = _mm512_cvtps_epi32(_mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v0, inv), _mm512_set1_ps(-127.0)), lim));
+            let q1 = _mm512_cvtps_epi32(_mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v1, inv), _mm512_set1_ps(-127.0)), lim));
+            let off = _mm512_set1_epi32(128);
+            let u0 = _mm512_cvtepi32_epi8(_mm512_add_epi32(q0, off));
+            let u1 = _mm512_cvtepi32_epi8(_mm512_add_epi32(q1, off));
+            _mm_storeu_si128(out.as_mut_ptr().add(b * 32) as *mut _, u0);
+            _mm_storeu_si128(out.as_mut_ptr().add(b * 32 + 16) as *mut _, u1);
+        }
+    }
+
     /// 16-wide dot product (f32), AVX-512
     #[target_feature(enable = "avx512f")]
     pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -225,12 +259,24 @@ enum Epi {
     Residual,
 }
 
-fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + libm_erf(x * std::f32::consts::FRAC_1_SQRT_2))
+/// erf with |error| <= 3e-7 (Abramowitz & Stegun 7.1.28): no exp, so loops over slices auto-vectorize.
+#[inline(always)]
+fn erf_f32(x: f32) -> f32 {
+    let a = x.abs();
+    let t = 1.0 + a * (0.0705230784 + a * (0.0422820123 + a * (0.0092705272 + a * (0.0001520143 + a * (0.0002765672 + a * 0.0000430638)))));
+    let t2 = t * t;
+    let t4 = t2 * t2;
+    let t8 = t4 * t4;
+    let r = 1.0 - 1.0 / (t8 * t8);
+    if x < 0.0 { -r } else { r }
 }
 
-fn libm_erf(x: f32) -> f32 {
-    libm::erf(x as f64) as f32
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gelu_slice(v: &mut [f32]) {
+    for x in v.iter_mut() {
+        *x = 0.5 * *x * (1.0 + erf_f32(*x * std::f32::consts::FRAC_1_SQRT_2));
+    }
 }
 
 pub struct CpuEngine {
@@ -327,10 +373,8 @@ impl CpuEngine {
             }
             Format::Bf16 => {
                 let mut a2 = vec![0u32; mp * k / 2];
-                a2.par_chunks_mut(k / 2).take(m).enumerate().for_each(|(r, row)| {
-                    for (k2, o) in row.iter_mut().enumerate() {
-                        *o = bf16_bits(x[r * ldx + 2 * k2]) as u32 | ((bf16_bits(x[r * ldx + 2 * k2 + 1]) as u32) << 16);
-                    }
+                a2.par_chunks_mut(k / 2).take(m).enumerate().for_each(|(r, row)| unsafe {
+                    k::to_bf16_pairs(&x[r * ldx..r * ldx + k], row)
                 });
                 (vec![], a2, vec![], vec![])
             }
@@ -338,16 +382,8 @@ impl CpuEngine {
                 let nb = k / QB;
                 let mut a8u = vec![128u8; mp * k];
                 let mut sa = vec![0f32; mp * nb];
-                a8u.par_chunks_mut(k).zip(sa.par_chunks_mut(nb)).take(m).enumerate().for_each(|(r, (row, srow))| {
-                    for b in 0..nb {
-                        let blk = &x[r * ldx + b * QB..r * ldx + (b + 1) * QB];
-                        let amax = blk.iter().fold(0f32, |mm, v| mm.max(v.abs()));
-                        let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                        srow[b] = s;
-                        for (t, v) in blk.iter().enumerate() {
-                            row[b * QB + t] = ((v / s).round().clamp(-127.0, 127.0) as i32 + 128) as u8;
-                        }
-                    }
+                a8u.par_chunks_mut(k).zip(sa.par_chunks_mut(nb)).take(m).enumerate().for_each(|(r, (row, srow))| unsafe {
+                    k::quant_row_u8(&x[r * ldx..r * ldx + k], row, srow)
                 });
                 (vec![], vec![], a8u, sa)
             }
@@ -380,14 +416,23 @@ impl CpuEngine {
                 for i in 0..rows {
                     let r = m0 + i;
                     let dst = unsafe { std::slice::from_raw_parts_mut((yptr as *mut f32).add(r * ldy + p * NT), 2 * NT) };
-                    for j in 0..2 * NT {
-                        let mut v = tile[i][j] + l.bias.as_ref().map_or(0.0, |b| b[p * NT + j]);
-                        match epi {
-                            Epi::Bias => {}
-                            Epi::Gelu => v = gelu(v),
-                            Epi::Residual => v += dst[j],
+                    let row = &mut tile[i];
+                    if let Some(b) = l.bias.as_ref() {
+                        for j in 0..2 * NT {
+                            row[j] += b[p * NT + j];
                         }
-                        dst[j] = v;
+                    }
+                    match epi {
+                        Epi::Bias => dst.copy_from_slice(row),
+                        Epi::Gelu => {
+                            unsafe { gelu_slice(row) };
+                            dst.copy_from_slice(row);
+                        }
+                        Epi::Residual => {
+                            for j in 0..2 * NT {
+                                dst[j] += row[j];
+                            }
+                        }
                     }
                 }
             }
@@ -416,30 +461,38 @@ impl CpuEngine {
         }
     }
 
-    /// attention for sequences given by (start row, length); queries: all rows or only the first (CLS)
+    /// attention for sequences given by (start row, length); queries: all rows or only the first (CLS).
+    /// Per (sequence, head): K is transposed once so scores are 16-key-wide FMAs; P*V accumulates rows of V.
     fn attention(qkv: &[f32], seqs: &[(usize, usize)], cls_only: bool, out: &mut [f32]) {
         let optr = out.as_mut_ptr() as usize;
         seqs.par_iter().flat_map(|&s| (0..H).into_par_iter().map(move |h| (s, h))).for_each(|((r0, len), h)| {
             let nq = if cls_only { 1 } else { len };
-            let mut sc = vec![0f32; len];
+            let lp = len.div_ceil(16) * 16;
+            let mut kt = vec![0f32; D * lp];
+            for j in 0..len {
+                let kk = &qkv[(r0 + j) * 3 * C + C + h * D..(r0 + j) * 3 * C + C + h * D + D];
+                for t in 0..D {
+                    kt[t * lp + j] = kk[t];
+                }
+            }
+            let mut sc = vec![0f32; lp];
             for qi in 0..nq {
                 let q = &qkv[(r0 + qi) * 3 * C + h * D..(r0 + qi) * 3 * C + h * D + D];
-                let mut mx = f32::NEG_INFINITY;
-                for j in 0..len {
-                    let kk = &qkv[(r0 + j) * 3 * C + C + h * D..(r0 + j) * 3 * C + C + h * D + D];
-                    let d: f32 = unsafe { k::dot(q, kk) } * 0.125;
-                    sc[j] = d;
-                    mx = mx.max(d);
+                sc.iter_mut().for_each(|v| *v = 0.0);
+                for t in 0..D {
+                    unsafe { k::axpy(q[t] * 0.125, &kt[t * lp..(t + 1) * lp], &mut sc) };
                 }
+                let mx = sc[..len].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let mut den = 0f32;
-                for v in sc.iter_mut() {
+                for v in sc[..len].iter_mut() {
                     *v = (*v - mx).exp();
                     den += *v;
                 }
+                let inv = 1.0 / den;
                 let mut o = [0f32; D];
                 for j in 0..len {
                     let vv = &qkv[(r0 + j) * 3 * C + 2 * C + h * D..(r0 + j) * 3 * C + 2 * C + h * D + D];
-                    unsafe { k::axpy(sc[j] / den, vv, &mut o) };
+                    unsafe { k::axpy(sc[j] * inv, vv, &mut o) };
                 }
                 let dst = unsafe { std::slice::from_raw_parts_mut((optr as *mut f32).add((r0 + qi) * C + h * D), D) };
                 dst.copy_from_slice(&o);
