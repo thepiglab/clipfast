@@ -1,0 +1,12 @@
+# site-specific job scripts, internal notes and raw logs
+local/
+results/
+# build outputs and model assets (never commit weights)
+build/
+rs/target/
+rs_assets/
+*.so
+*.safetensors
+*.bin
+__pycache__/
+.DS_Store

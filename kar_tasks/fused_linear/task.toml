@@ -1,0 +1,31 @@
+# Fused linear epilogues for ViT/BERT blocks: y = epi(x @ w.T + b [, r]), BF16 in/out, FP32 accumulation.
+#   mode 0: plain bias      (qkv)
+#   mode 1: bias + exact GELU (fc1)
+#   mode 2: bias + residual  (attn out-proj, fc2): y = r + x @ w.T + b
+name = "fused_linear_bf16"
+arch = "any"
+entry = "kernel_fn"
+reference = "reference.py:reference"
+exact = "reference.py:exact"
+baseline = "baseline.py"
+inputs = "inputs.py:make"
+shapes = "shapes.py:SCORED"
+nearby = "shapes.py:NEARBY"
+
+[tolerance]
+atol = 0.03
+rtol = 0.02
+mean_err_ratio = 2.0   # baseline rounds twice (GEMM, then epilogue); candidates may not do worse
+max_err_ratio = 4.0
+
+[rules]
+third_party = "allow"
+
+[bench]
+reps = 32
+copies = 2
+flush_bytes = 268435456
+
+[opmodel]
+bytes = "opmodel.py:min_bytes"
+flops = "opmodel.py:flops"

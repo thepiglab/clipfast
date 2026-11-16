@@ -1,0 +1,26 @@
+# Skinny linear: y = x @ w.T + b, x [M, K] bf16, w [N, K] bf16, b [N] bf16, y [M, N] bf16, FP32 accumulation.
+# The single-query / small-batch hot path of BiomedCLIP (BERT text tower M = tokens, ViT M = 197 * B).
+name = "skinny_linear_bf16"
+arch = "any"
+entry = "kernel_fn"
+reference = "reference.py:reference"
+exact = "reference.py:exact"
+baseline = "baseline.py"
+inputs = "inputs.py:make"
+shapes = "shapes.py:SCORED"
+nearby = "shapes.py:NEARBY"
+
+[tolerance]
+atol = 0.02
+rtol = 0.02
+mean_err_ratio = 2.5   # cuBLAS (the baseline) reduces split-K partials in bf16: 1.91x the fp32-accumulate error at fc2_m8
+max_err_ratio = 4.0
+
+[bench]
+reps = 48
+copies = 2
+flush_bytes = 268435456   # 256 MB > 128 MB L2: weights arrive cold, as in a full forward pass
+
+[opmodel]
+bytes = "opmodel.py:min_bytes"
+flops = "opmodel.py:flops"
