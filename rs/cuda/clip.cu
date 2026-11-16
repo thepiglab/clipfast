@@ -399,7 +399,11 @@ struct CF {
   std::map<std::tuple<int, int, int, long, long, long, int>, cublasLtMatmulAlgo_t> algos;
   size_t weight_bytes = 0, act_bytes = 0;
   int gelu_epilogue = 0;
-  int cutlass_gelu = 1;            // CUTLASS fc1 GEMM with fused exact-erf GELU (bf16, M >= 8192)
+  int cutlass_gelu = 1;
+  int quant = 0;                   // 1: MXFP8 block linears (opt-in; attention / norms / residual stay bf16)
+  int fp32_emu = 0;                // fp32 mode: cuBLAS BF16x9 emulated FP32 GEMMs (opt-in; falls back to true FP32)
+  std::map<const void*, std::pair<void*, void*>> qw;  // bf16 weight -> (fp8 values, UE8M0 scales)
+  void *qx = nullptr, *qsf = nullptr, *qtmp = nullptr;            // CUTLASS fc1 GEMM with fused exact-erf GELU (bf16, M >= 8192)
   int autotune = 0;                // opt-in: time top cuBLASLt heuristics per shape (r5 A/B: no gain, +0.4 GB scratch)
   void* scratch = nullptr;         // autotune output scratch (never live data)
   size_t scratch_bytes = 0;           // 1: cuBLASLt GELU_BIAS (tanh approx) instead of bias + exact-erf kernel
@@ -411,12 +415,25 @@ static void* WP(CF* cf, const std::string& n) {
   return it->second;
 }
 
+extern "C" size_t mx_sf_bytes(int rows, int K);
+extern "C" int mx_quantize(const void* x, long lda, int rows, int K, void* q, void* sf, cudaStream_t st);
+extern "C" int mx_gemm(cublasLtHandle_t lt, void* D, long ldd, const void* X, long lda, int M, const void* wq,
+                       const void* wsf, int N, int K, const void* bias, int mode, void* qx, void* qsf, void* tmp, void* ws,
+                       size_t ws_bytes, cudaStream_t st);
+
 // D[M,N] (row stride ldd) = A[M,K] (row stride lda) @ W[N,K]^T + bias (+ D if accumulate)
 static int gemm(CF* cf, void* Dp, long ldd, const void* A, long lda, const void* Wt, const void* bias, int M, int N,
                 int K, bool accumulate, bool gelu = false) {
+  if (cf->quant && cf->bf16) {
+    auto q = cf->qw.find(Wt);
+    if (q != cf->qw.end())
+      return mx_gemm(cf->lt, Dp, ldd, A, lda, M, q->second.first, q->second.second, N, K, bias,
+                     gelu ? 1 : (accumulate ? 2 : 0), cf->qx, cf->qsf, cf->qtmp, cf->ws, cf->ws_bytes, cf->st);
+  }
   cudaDataType_t ty = cf->bf16 ? CUDA_R_16BF : CUDA_R_32F;
   cublasLtMatmulDesc_t op;
-  CB(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  const cublasComputeType_t ct = (!cf->bf16 && cf->fp32_emu) ? CUBLAS_COMPUTE_32F_EMULATED_16BFX9 : CUBLAS_COMPUTE_32F;
+  CB(cublasLtMatmulDescCreate(&op, ct, CUDA_R_32F));
   cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
   CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
   CB(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
@@ -440,6 +457,15 @@ static int gemm(CF* cf, void* Dp, long ldd, const void* A, long lda, const void*
     int n = 0;
     CB(cublasLtMatmulAlgoGetHeuristic(cf->lt, op, la, lb, lc, lc, pref, cf->autotune ? 16 : 1, res, &n));
     cublasLtMatmulPreferenceDestroy(pref);
+    if (n < 1 && ct != CUBLAS_COMPUTE_32F) {  // no emulated kernel for this shape: true FP32 from now on
+      fprintf(stderr, "no BF16x9-emulated FP32 kernel for M%d N%d K%d; using true FP32\n", M, N, K);
+      cf->fp32_emu = 0;
+      cublasLtMatrixLayoutDestroy(la);
+      cublasLtMatrixLayoutDestroy(lb);
+      cublasLtMatrixLayoutDestroy(lc);
+      cublasLtMatmulDescDestroy(op);
+      return gemm(cf, Dp, ldd, A, lda, Wt, bias, M, N, K, accumulate, gelu);
+    }
     if (n < 1) { fprintf(stderr, "no cuBLASLt algo for M%d N%d K%d\n", M, N, K); return -1; }
     algo = res[0].algo;
     cudaStreamCaptureStatus cs;
@@ -508,6 +534,7 @@ extern "C" int cf_gemm_bias_gelu_bf16(void* D, const void* A, long lda, const vo
 // fc1 + exact GELU. bf16 large M: CUTLASS GEMM with fused erf-GELU epilogue (one rounding, no extra pass);
 // otherwise cuBLASLt (bias epilogue, or tanh GELU_BIAS if opted in) + the GELU kernel.
 static int fc1_gelu(CF* cf, void* F_, const void* A, long lda, const void* W, const void* b, int M) {
+  if (cf->quant && cf->bf16) return gemm(cf, F_, FF, A, lda, W, b, M, FF, C, false, true);  // MXFP8 + exact GELU epi
   if (cf->bf16 && cf->cutlass_gelu && !cf->gelu_epilogue && M >= 8192) {
     const int rc = cf_gemm_bias_gelu_bf16(F_, A, lda, W, b, M, FF, C, cf->st, 0);
     if (rc == 0) return 0;
@@ -699,6 +726,34 @@ int cf_set_option(CF* cf, const char* key, int value) {
     return 0;
   }
   if (!strcmp(key, "cutlass_gelu")) { cf->cutlass_gelu = value; return 0; }
+  if (!strcmp(key, "fp32_emu")) { cf->fp32_emu = value; return 0; }
+  if (!strcmp(key, "quant")) {
+    if (value != 1 || !cf->bf16) return -2;  // MXFP8 needs the bf16 engine
+    if (cf->quant) return 0;
+    const long rows = std::max<long>((long)cf->max_img * NTOK, cf->max_rows);
+    auto A = [&](void** p, size_t n) { cf->act_bytes += n; return cudaMalloc(p, n) == cudaSuccess; };
+    if (!A(&cf->qx, (size_t)rows * FF) || !A(&cf->qsf, mx_sf_bytes((int)rows, FF)) || !A(&cf->qtmp, (size_t)rows * FF * 2))
+      return -1;
+    for (int i = 0; i < LAYERS; i++)
+      for (int tw = 0; tw < 2; tw++) {
+        Blk& b = tw ? cf->tb[i] : cf->vb[i];
+        const std::pair<void*, std::pair<int, int>> lins[] = {{b.qkv.w, {3 * C, C}}, {b.o.w, {C, C}}, {b.fc1.w, {FF, C}},
+                                                              {b.fc2.w, {C, FF}}};
+        for (auto& l : lins) {
+          const int N = l.second.first, K = l.second.second;
+          void *q, *sf;
+          const size_t sfb = mx_sf_bytes(N, K);
+          CK(cudaMalloc(&q, (size_t)N * K));
+          CK(cudaMalloc(&sf, sfb));
+          if (mx_quantize(l.first, K, N, K, q, sf, cf->st)) return -1;
+          cf->qw[l.first] = {q, sf};
+          cf->weight_bytes += (size_t)N * K + sfb;
+        }
+      }
+    CK(cudaStreamSynchronize(cf->st));
+    cf->quant = 1;
+    return 0;
+  }
   return -1;
 }
 
@@ -795,6 +850,10 @@ void cf_destroy(CF* cf) {
   if (!cf) return;
   for (auto& kv : cf->graphs) cudaGraphExecDestroy(kv.second);
   for (auto& kv : cf->W) cudaFree(kv.second);
+  for (auto& kv : cf->qw) { cudaFree(kv.second.first); cudaFree(kv.second.second); }
+  cudaFree(cf->qx);
+  cudaFree(cf->qsf);
+  cudaFree(cf->qtmp);
   for (void* p : {cf->scratch, cf->ws, cf->x, cf->h, cf->qkv, cf->a, cf->f, cf->tmp, (void*)cf->px, (void*)cf->ids,
                   (void*)cf->pos, (void*)cf->cu,
                   (void*)cf->lens, (void*)cf->out, cf->emb})

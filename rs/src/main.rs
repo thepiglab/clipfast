@@ -9,9 +9,13 @@
 //! Output: one JSON object per line.
 //!   clipfast-rs export --model-dir DIR --out DIR                 (open_clip .bin -> safetensors + config + tokenizer)
 //!   clipfast-rs serve  --assets DIR [--port 8080] [--threads N]  (HTTP: POST /v1/embed/text, /v1/embed/image)
+//!   clipfast-rs search --corpus EMB.npy [--names NAMES.txt] (--queries Q.npy | --assets DIR --texts FILE)
+//!                      [--k 10] [--kc 200] [--rerank device|host] [--exact]   (int8 search + exact fp32 re-rank)
+//!   clipfast-rs search-bench --assets DIR [--real 200000] [--synth 1800000] [--nq 1,8,256,2048] [--k 10]
 use anyhow::{anyhow, Result};
 use clipfast_rs::engine::*;
 use clipfast_rs::frontend::*;
+use clipfast_rs::search::{Index, Rerank};
 use clipfast_rs::{export, server};
 use safetensors::SafeTensors;
 use std::collections::HashMap;
@@ -336,6 +340,149 @@ fn cmd_embed(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ---------------- search ----------------
+fn rerank_arg(args: &[String]) -> Rerank {
+    if arg(args, "--rerank").as_deref() == Some("host") { Rerank::Host } else { Rerank::Device }
+}
+
+fn cmd_search(args: &[String]) -> Result<()> {
+    let (corpus, shape) = read_npy(&arg(args, "--corpus").ok_or(anyhow!("--corpus"))?)?;
+    let d = *shape.last().unwrap_or(&512);
+    let names: Option<Vec<String>> = arg(args, "--names").map(|p| std::fs::read_to_string(p).map(|s| s.lines().map(String::from).collect())).transpose()?;
+    let k: usize = arg(args, "--k").map(|s| s.parse()).transpose()?.unwrap_or(10);
+    let kc: usize = arg(args, "--kc").map(|s| s.parse()).transpose()?.unwrap_or(200).max(k);
+    let (q, labels): (Vec<f32>, Vec<String>) = if let Some(qp) = arg(args, "--queries") {
+        let (q, s) = read_npy(&qp)?;
+        let n = q.len() / *s.last().unwrap_or(&d);
+        (q, (0..n).map(|i| i.to_string()).collect())
+    } else {
+        let assets = arg(args, "--assets").ok_or(anyhow!("--assets or --queries"))?;
+        let texts: Vec<String> = std::fs::read_to_string(arg(args, "--texts").ok_or(anyhow!("--texts"))?)?
+            .lines().map(String::from).collect();
+        let eng = Engine::new(&assets, false)?;
+        let rows = Tok::load(&assets)?.encode(&texts)?;
+        (eng.encode_texts_packed(&rows, 0)?, texts)
+    };
+    let idx = Index::new(&corpus, d, rerank_arg(args))?;
+    let t0 = Instant::now();
+    let (ids, sc) = idx.search(&q, k, kc, args.iter().any(|a| a == "--exact"))?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    for (qi, lab) in labels.iter().enumerate() {
+        let hits: Vec<serde_json::Value> = (0..k).map(|j| {
+            let id = ids[qi * k + j];
+            serde_json::json!({"id": id, "score": sc[qi * k + j],
+                "name": names.as_ref().and_then(|n| n.get(id.max(0) as usize)).cloned()})
+        }).collect();
+        println!("{}", serde_json::json!({"query": lab, "hits": hits}));
+    }
+    let (dm, hm, wm, _) = idx.mem();
+    eprintln!("{}", serde_json::json!({"kind": "search", "corpus": idx.n, "queries": labels.len(), "ms": ms,
+        "device_mb": dm, "host_mb": hm, "workspace_mb": wm}));
+    Ok(())
+}
+
+fn cmd_search_bench(args: &[String]) -> Result<()> {
+    let assets = arg(args, "--assets").ok_or(anyhow!("--assets"))?;
+    let n_real: usize = arg(args, "--real").map(|s| s.parse()).transpose()?.unwrap_or(200_000);
+    let n_syn: usize = arg(args, "--synth").map(|s| s.parse()).transpose()?.unwrap_or(1_800_000);
+    let k: usize = arg(args, "--k").map(|s| s.parse()).transpose()?.unwrap_or(10);
+    let kc: usize = arg(args, "--kc").map(|s| s.parse()).transpose()?.unwrap_or(200);
+    let rr = rerank_arg(args);
+    let eng = Engine::new(&assets, false)?;
+    let mut rng = Rng(0x2545F4914F6CDD1D);
+    let caption = |rng: &mut Rng| -> Vec<i32> {
+        let n = (40.0 * (0.8 * rng.normal()).exp()).round().clamp(5.0, 256.0) as usize;
+        let mut r = vec![2i32];
+        r.extend((0..n - 2).map(|_| 1000 + (rng.next() % 29000) as i32));
+        r.push(3);
+        r
+    };
+    // corpus: real BiomedCLIP text embeddings + clustered synthetic unit vectors
+    let rows: Vec<Vec<i32>> = (0..n_real).map(|_| caption(&mut rng)).collect();
+    let t0 = Instant::now();
+    let mut corpus = eng.encode_texts_packed(&rows, 0)?;
+    let enc_s = t0.elapsed().as_secs_f64();
+    const D: usize = 512;
+    let centers: Vec<f32> = (0..1000 * D).map(|_| rng.normal() as f32).collect();
+    for i in 0..n_syn {
+        let c = (rng.next() % 1000) as usize;
+        let mut v: Vec<f32> = (0..D).map(|t| centers[c * D + t] + 0.6 * rng.normal() as f32).collect();
+        let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter_mut().for_each(|x| *x /= nrm);
+        corpus.extend_from_slice(&v);
+        let _ = i;
+    }
+    // queries: fresh text embeddings (text->text) and random-pixel image embeddings (image->text)
+    let maxq = list(args, "--nq", "1,8,256,2048").iter().map(|s| s.parse::<usize>().unwrap()).max().unwrap();
+    let qrows: Vec<Vec<i32>> = (0..maxq).map(|_| caption(&mut rng)).collect();
+    let mut queries = eng.encode_texts_packed(&qrows, 0)?;
+    let px: Vec<f32> = (0..64 * IMG).map(|_| rng.normal() as f32).collect();
+    let qi = eng.encode_images(&px, 0)?;
+    // every other query among the first 128 is an image embedding (image -> text retrieval)
+    for v in 0..64usize.min(maxq / 2) {
+        let j = 2 * v + 1;
+        queries[j * D..(j + 1) * D].copy_from_slice(&qi[v * D..(v + 1) * D]);
+    }
+    drop(eng);
+    let t0 = Instant::now();
+    let idx = Index::new(&corpus, D, rr)?;
+    let build_s = t0.elapsed().as_secs_f64();
+    let (dm, hm, wm, sg) = idx.mem();
+    let n = idx.n as f64 / 1e6;
+    println!("{}", serde_json::json!({"kind": "index", "n": idx.n, "real": n_real, "synthetic": n_syn, "encode_s": enc_s,
+        "build_s": build_s, "rerank": format!("{rr:?}"), "device_mb": dm, "host_mb": hm, "device_mb_per_million": dm / n,
+        "host_mb_per_million": hm / n, "int8_scale": sg}));
+    // CPU brute-force reference for the first 2 queries (validates the GPU exact path itself)
+    {
+        let q2 = &queries[..2 * D];
+        let (ge, _) = idx.search(q2, k, kc, true)?;
+        let (gq, _) = idx.search(q2, k, kc, false)?;
+        for r in 0..2 {
+            let qv = &q2[r * D..(r + 1) * D];
+            let mut s: Vec<(f32, i32)> = corpus.chunks_exact(D).enumerate()
+                .map(|(i, x)| (x.iter().zip(qv).map(|(a, b)| a * b).sum::<f32>(), i as i32)).collect();
+            s.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap());
+            s.truncate(k);
+            s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let cpu: Vec<i32> = s.iter().map(|x| x.1).collect();
+            println!("{}", serde_json::json!({"kind": "cpu_check", "query": r, "cpu_top": cpu,
+                "gpu_exact_matches_cpu": cpu == ge[r * k..(r + 1) * k].to_vec(),
+                "gpu_int8_rerank_matches_cpu": cpu == gq[r * k..(r + 1) * k].to_vec(), "cpu_best": s[0].0}));
+        }
+    }
+    for nqs in list(args, "--nq", "1,8,256,2048") {
+        let nq: usize = nqs.parse()?;
+        let q = &queries[..nq * D];
+        let timed = |exact: bool| -> Result<(f64, Vec<i32>, Vec<f32>)> {
+            let (ids, sc) = idx.search(q, k, kc, exact)?;   // warm (workspace growth)
+            let reps = (2000 / nq).clamp(3, 50);
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                idx.search(q, k, kc, exact)?;
+            }
+            Ok((t0.elapsed().as_secs_f64() * 1e3 / reps as f64, ids, sc))
+        };
+        let (ms_exact, ide, sce) = timed(true)?;
+        let (ms_q, idq, scq) = timed(false)?;
+        let (mut same, mut overlap, mut max_sdiff) = (0usize, 0usize, 0f32);
+        for r in 0..nq {
+            let a = &ide[r * k..(r + 1) * k];
+            let b = &idq[r * k..(r + 1) * k];
+            same += (a == b) as usize;
+            overlap += a.iter().filter(|x| b.contains(x)).count();
+            for j in 0..k {
+                max_sdiff = max_sdiff.max((sce[r * k + j] - scq[r * k + j]).abs());
+            }
+        }
+        println!("{}", serde_json::json!({"kind": "search", "nq": nq, "k": k, "kc": kc, "rerank": format!("{rr:?}"),
+            "exact_fp32_ms": ms_exact, "int8_rerank_ms": ms_q, "speedup": ms_exact / ms_q,
+            "topk_identical": format!("{same}/{nq}"), "overlap_at_k": overlap as f64 / (nq * k) as f64,
+            "max_score_diff": max_sdiff, "workspace_mb": idx.mem().2}));
+    }
+    let _ = wm;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -344,6 +491,8 @@ fn main() -> Result<()> {
         Some("embed") => cmd_embed(&args),
         Some("prep") => cmd_prep(&args),
         Some("tokenize") => cmd_tokenize(&args),
+        Some("search") => cmd_search(&args),
+        Some("search-bench") => cmd_search_bench(&args),
         Some("export") => {
             let md = arg(&args, "--model-dir").ok_or(anyhow!("--model-dir"))?;
             let out = arg(&args, "--out").ok_or(anyhow!("--out"))?;

@@ -86,3 +86,22 @@ pub fn prep_batch(tp: &rayon::ThreadPool, paths: &[String]) -> (Vec<f32>, Vec<St
     }
     (px, ok, bad)
 }
+/// Read a little-endian float32 .npy (C order). Returns (data, shape).
+pub fn read_npy(path: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+    let b = std::fs::read(path)?;
+    if b.len() < 10 || &b[..6] != b"\x93NUMPY" {
+        return Err(anyhow!("{path}: not a .npy file"));
+    }
+    let (hl, off) = if b[6] == 1 { (u16::from_le_bytes([b[8], b[9]]) as usize, 10) } else {
+        (u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize, 12)
+    };
+    let h = std::str::from_utf8(&b[off..off + hl])?;
+    if !h.contains("'<f4'") || h.contains("'fortran_order': True") {
+        return Err(anyhow!("{path}: need little-endian float32 C-order (header {h})"));
+    }
+    let shp = h.split("'shape':").nth(1).and_then(|s| s.split('(').nth(1)).and_then(|s| s.split(')').next())
+        .ok_or_else(|| anyhow!("{path}: bad header"))?;
+    let shape: Vec<usize> = shp.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let data = b[off + hl..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    Ok((data, shape))
+}
