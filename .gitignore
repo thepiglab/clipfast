@@ -10,3 +10,6 @@ rs_assets/
 *.bin
 __pycache__/
 .DS_Store
+
+# built python extension
+python/*.so

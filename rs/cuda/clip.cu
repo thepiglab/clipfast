@@ -734,31 +734,34 @@ int cf_finalize(CF* cf) {
 
 // Input/output pointers may be host or device memory (cudaMemcpyDefault, UVA), so Python can pass torch tensors.
 // flags: 1 = pixels already in the device input buffer (skip H2D), 2 = no CUDA graph, 4 = skip D2H of embeddings
-int cf_encode_image(CF* cf, const float* pixels, int B, float* out, int flags) {
-  if (B > cf->max_img) return -2;
-  if (!(flags & 1)) CK(cudaMemcpyAsync(cf->px, pixels, (size_t)B * 3 * 224 * 224 * 4, cudaMemcpyDefault, cf->st));
+int cf_encode_image(CF* cf, const float* pixels, int n_in, int B, float* out, int n_out, int flags) {
+  if (B > cf->max_img || n_in > B || n_out > B) return -2;
+  if (!(flags & 1) && n_in > 0)
+    CK(cudaMemcpyAsync(cf->px, pixels, (size_t)n_in * 3 * 224 * 224 * 4, cudaMemcpyDefault, cf->st));
+  // rows n_in..B of the input buffer keep earlier (finite) data; their embeddings are never copied out
   TRY(run(cf, 0, B, 0, !(flags & 2)));
-  if (!(flags & 4)) CK(cudaMemcpyAsync(out, cf->out, (size_t)B * E * 4, cudaMemcpyDefault, cf->st));
+  if (!(flags & 4) && n_out > 0) CK(cudaMemcpyAsync(out, cf->out, (size_t)n_out * E * 4, cudaMemcpyDefault, cf->st));
   CK(cudaStreamSynchronize(cf->st));
   return 0;
 }
 
 // ids [B*L] int32 padded with pad id to L; lens [B] = real length of each row.
-int cf_encode_text(CF* cf, const int* ids, const int* lens, int B, int L, float* out, int flags) {
+int cf_encode_text(CF* cf, const int* ids, const int* lens, int B, int L, float* out, int n_out, int flags) {
   if ((long)B * L > cf->max_rows || L > 512) return -2;
   if (!(flags & 1)) {
     CK(cudaMemcpyAsync(cf->ids, ids, (size_t)B * L * 4, cudaMemcpyDefault, cf->st));
     CK(cudaMemcpyAsync(cf->lens, lens, (size_t)B * 4, cudaMemcpyDefault, cf->st));
   }
   TRY(run(cf, 1, B, L, !(flags & 2)));
-  if (!(flags & 4)) CK(cudaMemcpyAsync(out, cf->out, (size_t)B * E * 4, cudaMemcpyDefault, cf->st));
+  if (!(flags & 4) && n_out > 0) CK(cudaMemcpyAsync(out, cf->out, (size_t)std::min(n_out, B) * E * 4, cudaMemcpyDefault, cf->st));
   CK(cudaStreamSynchronize(cf->st));
   return 0;
 }
 
 // Packed varlen text: ids/pos [T] int32 (T may include filler tokens past cu[B]), cu [B+1] int32; each sequence
 // at most 256 tokens. One CUDA graph per (B, T).
-int cf_encode_text_packed(CF* cf, const int* ids, const int* pos, const int* cu, int B, int T, float* out, int flags) {
+int cf_encode_text_packed(CF* cf, const int* ids, const int* pos, const int* cu, int B, int T, float* out, int n_out,
+                          int flags) {
   if (T > cf->max_rows || B > std::max(cf->max_img, cf->max_rows / 8)) return -2;
   if (!(flags & 1)) {
     CK(cudaMemcpyAsync(cf->ids, ids, (size_t)T * 4, cudaMemcpyDefault, cf->st));
@@ -766,7 +769,7 @@ int cf_encode_text_packed(CF* cf, const int* ids, const int* pos, const int* cu,
     CK(cudaMemcpyAsync(cf->cu, cu, (size_t)(B + 1) * 4, cudaMemcpyDefault, cf->st));
   }
   TRY(run(cf, 2, B, T, !(flags & 2)));
-  if (!(flags & 4)) CK(cudaMemcpyAsync(out, cf->out, (size_t)B * E * 4, cudaMemcpyDefault, cf->st));
+  if (!(flags & 4) && n_out > 0) CK(cudaMemcpyAsync(out, cf->out, (size_t)std::min(n_out, B) * E * 4, cudaMemcpyDefault, cf->st));
   CK(cudaStreamSynchronize(cf->st));
   return 0;
 }

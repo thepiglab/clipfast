@@ -1,0 +1,3 @@
+# The product is the Rust/CUDA runtime (rs/) and its Python extension (python/).
+# research/ holds the PyTorch reference runtime, benchmarks, parity harnesses and kernel tasks.
+research/** linguist-vendored

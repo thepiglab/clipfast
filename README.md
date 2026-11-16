@@ -57,71 +57,99 @@ Weights load in ~0.25 s; full speed after one warm-up call per shape bucket.
 
 Tried and dropped (measured): cuBLASLt heuristic autotune (no gain), cuBLASLt tanh-GELU epilogue (same speed,
 lower parity than exact erf), fp8 e4m3 (1.42x at large batch but cos ~0.998, kept as an opt-in experiment in the
-PyTorch path only).
+PyTorch research path only).
 
 Kernel work followed the kernel-autoresearch method (freeze a task, prove the evaluator with cheating canaries,
 calibrate the GPU, A/B with confidence intervals, keep only verified wins); task definitions are in `kar_tasks/`.
 One finding: cuBLAS's small-M path reduces split-K partials in bf16, 1.9x the error of fp32 accumulation; our
 skinny kernel accumulates in fp32.
 
-## Status
+## Using it
 
-- `clipfast-rs` runs the full model from exported tensors (pixels already preprocessed, token ids):
-  `parity` and `bench` commands. **Next for production use:** Rust tokenizer (`tokenizers` crate on the model's own
-  `tokenizer.json`), open_clip-identical JPEG/PNG decode + resize/crop on CPU threads (optional nvJPEG), and an
-  `embed` command / HTTP server.
-- Training is out of scope here (PyTorch; a lean model reference is in `clipfast/train_model.py`).
-
-## Build and run (Rust)
+Everything below is Rust + CUDA; Python appears only in the optional extension and in `research/`.
 
 ```bash
-# 1. export weights + parity goldens from a local copy of the model (Python, CPU; needs open_clip, safetensors)
-BIOMEDCLIP_DIR=/path/to/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 python export_rs.py rs_assets
+# 1. export runtime assets straight from the open_clip checkpoint folder (no PyTorch needed)
+clipfast-rs export --model-dir /path/to/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --out assets
 
-# 2. build (CUDA >= 12.8 for sm_120a; CUTLASS headers enable the fused erf-GELU GEMM)
-cd rs
-CUDA_HOME=/usr/local/cuda CUTLASS_DIR=/path/to/cutlass CLIPFAST_CUDA_ARCH=120a cargo build --release
+# 2a. embed files: a folder (or list) of JPEG/PNG/... images and/or a file with one caption per line
+clipfast-rs embed --assets assets --images ./figures --texts captions.txt --out run1
+#    -> run1.images.npy / run1.images.txt (paths), run1.texts.npy   (float32 [N, 512], L2-normalized)
 
-# 3. run
-./target/release/clipfast-rs parity --assets ../rs_assets            # add --fp32 for parity mode, --packed for varlen text
-./target/release/clipfast-rs bench  --assets ../rs_assets --img-b 1,64,1024 --txt-b 1,1024 --txt-l 32,256,pmc --packed
+# 2b. or serve it over HTTP
+clipfast-rs serve --assets assets --port 8080
+curl -s localhost:8080/v1/embed/text -d '{"texts": ["chest x-ray with bilateral opacities"]}'
+curl -s localhost:8080/v1/embed/image -H 'Content-Type: image/jpeg' --data-binary @figure.jpg
 ```
 
-Build on local disk (rust-lld can fail on some network filesystems). `CLIPFAST_CUDA_ARCH=100a,120a` also
-targets B200.
+Front-end parity, measured against open_clip's Python path:
+- **Pixels:** bit-identical (max diff 0.0) on 47 files: JPEG 4:4:4 and 4:2:0, grayscale JPEG, PNG RGB, RGBA and
+  palette, sizes from 97x333 to 3000x2400, and the model's example images.
+- **Token ids:** identical on probe prompts plus unicode, markup and over-length text.
+- **`embed` end to end:** cos 0.99986 (bf16), 0.9999998 (fp32), with top-1 retrieval identical.
+- **Exported weights:** byte-identical to a PyTorch-side export (302 tensors, f32 and bf16).
 
-## Optional: Python binding
+What the front end does, all in Rust:
+- **Tokenizer:** the `tokenizers` crate reading the model's own `tokenizer.json`, with open_clip's whitespace
+  cleanup. Captions are truncated to 256 tokens and packed (no padding).
+- **Images:** decoded with libjpeg-turbo (JPEG, the same decoder Pillow uses) or the `image` crate (PNG, BMP, TIFF,
+  WebP, GIF). They are then resized with a re-implementation of Pillow's fixed-point bicubic resampler and
+  center-cropped, matching open_clip's `Image.open(p).convert("RGB")` + eval transform. Decoding runs on a CPU thread
+  pool and overlaps GPU encoding.
+- **Weights:** the PyTorch checkpoint (zip + pickle) is read directly, and the q/k/v fusion and folding are done in
+  Rust.
 
-`clipfast/rs_py.py` loads the same CUDA engine as a shared library (ctypes) and passes torch tensors by pointer,
-for use inside PyTorch code, e.g. embedding a validation set during training. It is a convenience layer, not the main
-interface: it is **~7% slower than the Rust CLI** in places because shape bucketing and text packing run in Python
-(image batch 1024: 7.85k vs 8.4k img/s; 1024 caption-length texts: 36.8 vs 30.0 ms; 79 ms from raw strings
-including tokenization). Parity is identical (tokenizer ids match open_clip; same embeddings).
+Other commands: `parity` (against golden embeddings from `research/golden.py`), `bench`, `prep` (dump
+preprocessed pixels) and `tokenize`.
+
+**Next:** an int8 corpus index with exact re-ranking for retrieval, an opt-in MXFP8 encoder mode, and faster fp32
+parity mode (3xTF32).
+
+## Build
 
 ```bash
-CUTLASS_DIR=/path/to/cutlass scripts/build_lib.sh          # -> build/libclipfast_cuda.so
+cd rs
+CUDA_HOME=/usr/local/cuda CUTLASS_DIR=/path/to/cutlass CLIPFAST_CUDA_ARCH=120a cargo build --release
+# -> target/release/clipfast-rs
+```
+
+Requirements: CUDA >= 12.8 for sm_120a (`CLIPFAST_CUDA_ARCH=100a,120a` also targets B200). CUTLASS headers
+(v3.9.x, not vendored) enable the fused exact-GELU GEMM. Build on local disk, because rust-lld can fail on some
+network filesystems.
+
+## Python extension (optional)
+
+A native extension (PyO3, abi3, any CPython >= 3.9) exposes the same engine to PyTorch code, for example to
+embed a validation set during training. Tokenization, shape bucketing and text packing run in Rust; tensors are
+passed by address, on CUDA or CPU.
+
+```bash
+scripts/build_python.sh          # -> python/clipfast_rs.abi3.so
 ```
 
 ```python
-from clipfast.rs_py import ClipFastRS
-m = ClipFastRS("rs_assets")                 # fp32=True for parity mode
-img = m.encode_images(pixels)               # float [B,3,224,224], open_clip-preprocessed -> cuda [B,512], L2-normalized
-txt = m.encode_texts(["chest x-ray with bilateral opacities", ...])
+from clipfast_rs_torch import ClipFast            # python/clipfast_rs_torch.py, ~30 lines over `import clipfast_rs`
+m = ClipFast("assets")                            # fp32=True for parity mode
+img = m.encode_images(pixels)                     # float [B,3,224,224] open_clip-preprocessed -> cuda [B,512]
+txt = m.encode_texts(["chest x-ray with bilateral opacities"])
 logits = m.logit_scale * img @ txt.T
 ```
+
+From Python, the extension matches the CLI: image batch 1024 runs at 8.40k img/s (CLI 8.43k). 1,024 captions take
+48 ms from raw strings including tokenization, and 35 ms from token ids (CLI 30 ms; the gap is converting Python
+lists to Rust vectors). Parity is identical (cos 0.99990 / 0.99992 bf16, 0.9999999 fp32; token ids match open_clip).
 
 ## Repository layout
 
 | path | what |
 |---|---|
-| `rs/` | Rust crate (`src/main.rs`) + CUDA engine (`cuda/clip.cu`, `cuda/gemm_gelu.cu`) |
-| `clipfast/rs_py.py` | optional Python binding |
-| `clipfast/fast.py`, `clipfast/kernels.py` | PyTorch research runtime (CUDA graphs, Triton fused epilogues, skinny GEMM, fp8 experiment) |
-| `export_rs.py` | weights + golden parity export for the Rust runtime |
-| `bench.py`, `report.py` | PyTorch benchmark matrix (parity, speed, memory) vs open_clip baselines |
-| `cpu_feed_bench.py`, `gpu_feed_bench.py` | data-feeding throughput (PIL / torchvision / nvJPEG) |
-| `kar_tasks/` | frozen kernel tasks (skinny linear, fused-epilogue linear) |
-| `clipfast/train_model.py`, `train_bench.py` | lean trainable model + training-step benchmark (reference) |
+| `rs/src/engine.rs`, `rs/cuda/` | GPU engine: CUDA kernels (`clip.cu`), CUTLASS fused GELU GEMM (`gemm_gelu.cu`), batching |
+| `rs/src/frontend.rs`, `rs/src/prep.rs` | tokenizer, image decode + open_clip-identical preprocessing, `.npy` output |
+| `rs/src/export.rs` | PyTorch checkpoint reader + runtime safetensors writer |
+| `rs/src/server.rs` | HTTP server |
+| `rs/src/main.rs` | CLI (`export`, `embed`, `serve`, `parity`, `bench`, `prep`, `tokenize`) |
+| `rs/src/py.rs`, `python/` | optional native Python extension + torch wrapper |
+| `research/` | PyTorch reference runtime and benchmarks against open_clip, parity goldens and tests, data-feeding benchmarks, kernel-autoresearch tasks |
 
 ## Feeding the GPU
 
