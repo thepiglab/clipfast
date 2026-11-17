@@ -61,6 +61,18 @@ impl Engine {
             let k = std::ffi::CString::new("cutlass_gelu")?;
             unsafe { cf_set_option(cf, k.as_ptr(), 0) };
         }
+        if std::env::var("CLIPFAST_TILES").map(|v| v == "0").unwrap_or(false) {
+            let k = std::ffi::CString::new("tiles")?;
+            unsafe { cf_set_option(cf, k.as_ptr(), 0) };
+        }
+        if let Ok(m) = std::env::var("CLIPFAST_TILES_MIN_M") {
+            let k = std::ffi::CString::new("tiles_min_m")?;
+            unsafe { cf_set_option(cf, k.as_ptr(), m.parse()?) };
+        }
+        if let Ok(m) = std::env::var("CLIPFAST_TILES_MAX_M") {
+            let k = std::ffi::CString::new("tiles_max_m")?;
+            unsafe { cf_set_option(cf, k.as_ptr(), m.parse()?) };
+        }
         if std::env::var("CLIPFAST_AUTOTUNE").map(|v| v == "1").unwrap_or(false) {
             let k = std::ffi::CString::new("autotune")?;
             unsafe { cf_set_option(cf, k.as_ptr(), 1) };
@@ -226,11 +238,11 @@ pub fn impl_name(fp32: bool) -> String {
     let g = std::env::var("CLIPFAST_GELU_EPILOGUE").map(|v| v == "1").unwrap_or(false);
     let p = std::env::args().any(|a| a == "--packed");
     let nc = std::env::var("CLIPFAST_CUTLASS_GELU").map(|v| v == "0").unwrap_or(false);
-    let na = false;
+    let na = std::env::var("CLIPFAST_TILES").map(|v| v == "0").unwrap_or(false);
     let q = std::env::var("CLIPFAST_QUANT").map(|v| v == "mxfp8").unwrap_or(false) || std::env::args().any(|a| a == "mxfp8");
     let emu = std::env::var("CLIPFAST_FP32_EMU").map(|v| v == "1").unwrap_or(false);
     format!("rs_{}{}{}{}{}{}{}", if fp32 { "fp32" } else { "bf16" }, if emu && fp32 { "_bf16x9" } else { "" }, if q { "_mxfp8" } else { "" }, if g { "_geluepi" } else { "" }, if p { "_pack" } else { "" },
-            if nc { "_nocutlass" } else { "" }, if na { "_noautotune" } else { "" })
+            if nc { "_nocutlass" } else { "" }, if na { "_notiles" } else { "" })
 }
 
 pub fn bucket(n: usize) -> usize {

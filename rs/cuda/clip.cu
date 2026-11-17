@@ -400,6 +400,9 @@ struct CF {
   size_t weight_bytes = 0, act_bytes = 0;
   int gelu_epilogue = 0;
   int cutlass_gelu = 1;
+  int tiles = 1;                   // per-shape CUTLASS tiles for qkv / fc1 (kar vit_gemm sweep); 0 = previous kernels
+  int tiles_min_m = 4096;          // M window that uses the CUTLASS tiles: engine A/B (r18) won only for
+  int tiles_max_m = 10240;         // M ~ 6-8k (+3..6%) and lost slightly at 3k and >= 12k
   int quant = 0;                   // 1: MXFP8 block linears (opt-in; attention / norms / residual stay bf16)
   int fp32_emu = 0;                // fp32 mode: cuBLAS BF16x9 emulated FP32 GEMMs (opt-in; falls back to true FP32)
   std::map<const void*, std::pair<void*, void*>> qw;  // bf16 weight -> (fp8 values, UE8M0 scales)
@@ -415,6 +418,8 @@ static void* WP(CF* cf, const std::string& n) {
   return it->second;
 }
 
+extern "C" int cf_gemm_bias_bf16(void* D, const void* A, long lda, const void* W, const void* bias, int M, int N,
+                                 int K, cudaStream_t st, int variant);
 extern "C" size_t mx_sf_bytes(int rows, int K);
 extern "C" int mx_quantize(const void* x, long lda, int rows, int K, void* q, void* sf, cudaStream_t st);
 extern "C" int mx_gemm(cublasLtHandle_t lt, void* D, long ldd, const void* X, long lda, int M, const void* wq,
@@ -429,6 +434,14 @@ static int gemm(CF* cf, void* Dp, long ldd, const void* A, long lda, const void*
     if (q != cf->qw.end())
       return mx_gemm(cf->lt, Dp, ldd, A, lda, M, q->second.first, q->second.second, N, K, bias,
                      gelu ? 1 : (accumulate ? 2 : 0), cf->qx, cf->qsf, cf->qtmp, cf->ws, cf->ws_bytes, cf->st);
+  }
+  // qkv projection: CUTLASS tile chosen per M (bit-identical output to cuBLASLt's kernel in the sweep)
+  if (cf->bf16 && cf->tiles && !accumulate && !gelu && bias && N == 3 * C && K == C && ldd == N && M >= cf->tiles_min_m &&
+      M <= cf->tiles_max_m) {
+    const int rc = cf_gemm_bias_bf16(Dp, A, lda, Wt, bias, M, N, K, cf->st, 1);
+    if (rc == 0) return 0;
+    fprintf(stderr, "cutlass qkv gemm unavailable (rc %d); using cuBLASLt\n", rc);
+    cf->tiles = 0;
   }
   cudaDataType_t ty = cf->bf16 ? CUDA_R_16BF : CUDA_R_32F;
   cublasLtMatmulDesc_t op;
@@ -535,8 +548,10 @@ extern "C" int cf_gemm_bias_gelu_bf16(void* D, const void* A, long lda, const vo
 // otherwise cuBLASLt (bias epilogue, or tanh GELU_BIAS if opted in) + the GELU kernel.
 static int fc1_gelu(CF* cf, void* F_, const void* A, long lda, const void* W, const void* b, int M) {
   if (cf->quant && cf->bf16) return gemm(cf, F_, FF, A, lda, W, b, M, FF, C, false, true);  // MXFP8 + exact GELU epi
-  if (cf->bf16 && cf->cutlass_gelu && !cf->gelu_epilogue && M >= 8192) {
-    const int rc = cf_gemm_bias_gelu_bf16(F_, A, lda, W, b, M, FF, C, cf->st, 0);
+  const bool tiled = cf->tiles && M >= cf->tiles_min_m && M <= cf->tiles_max_m;
+  if (cf->bf16 && cf->cutlass_gelu && !cf->gelu_epilogue && (M >= 8192 || tiled)) {
+    const int v = tiled ? 1 : 0;
+    const int rc = cf_gemm_bias_gelu_bf16(F_, A, lda, W, b, M, FF, C, cf->st, v);
     if (rc == 0) return 0;
     fprintf(stderr, "cutlass gelu gemm unavailable (rc %d); falling back to cuBLASLt + GELU kernel\n", rc);
     cf->cutlass_gelu = 0;
@@ -726,6 +741,9 @@ int cf_set_option(CF* cf, const char* key, int value) {
     return 0;
   }
   if (!strcmp(key, "cutlass_gelu")) { cf->cutlass_gelu = value; return 0; }
+  if (!strcmp(key, "tiles")) { cf->tiles = value; return 0; }
+  if (!strcmp(key, "tiles_min_m")) { cf->tiles_min_m = value; return 0; }
+  if (!strcmp(key, "tiles_max_m")) { cf->tiles_max_m = value; return 0; }
   if (!strcmp(key, "fp32_emu")) { cf->fp32_emu = value; return 0; }
   if (!strcmp(key, "quant")) {
     if (value != 1 || !cf->bf16) return -2;  // MXFP8 needs the bf16 engine

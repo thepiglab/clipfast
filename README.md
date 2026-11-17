@@ -163,6 +163,22 @@ All three formats agree with open_clip on image-to-text top-1 (32/32). Weights t
 clipfast-rs cpu-bench --assets assets --format q8 --threads 16 --pin
 ```
 
+## GEMM tile tuning (kar `vit_gemm` task)
+
+`research/kar_tasks/vit_gemm/sweep.cu` times the four ViT-B/16 linear shapes (qkv, attention output, fc1, fc2) at
+M = 6,304 and 50,432 rows. It compares ten CUTLASS sm80 tensor-op tile and pipeline-stage choices against cuBLASLt's
+pick, and every candidate's output is checked against cuBLASLt's (all were bit-identical). In isolation, a 128x128
+4-stage tile wins up to 1.20x on qkv and 1.09x on fc1 (with GELU fused) for M of about 6k. At M = 50k the wins are
+5% or less.
+
+In the whole engine, the r18 A/B (3 rounds, interleaved) gained only in a band: images at batch 32 were 1.057x
+faster, text at M = 8,192 (64 x 128 or 256 x 32 tokens) was 1.028x faster, and other sizes were up to 2% slower. So
+the engine uses these tiles only for qkv and fc1 with 4,096 <= M <= 10,240 and keeps the previous kernels elsewhere.
+`CLIPFAST_TILES=0` turns them off, and `CLIPFAST_TILES_MIN_M` / `CLIPFAST_TILES_MAX_M` move the band. Parity is
+unchanged: worst image cosine vs open_clip fp32 is 0.99991 with the tiles and 0.99990 without, and image-to-text
+top-1 is 32/32 either way. A 5-round A/B of this banded version is still running; this section will be updated with
+its result.
+
 ## Lower-precision modes we measured (and do not recommend on RTX PRO 6000)
 
 | mode | parity vs open_clip fp32 | speed vs bf16 | verdict |
